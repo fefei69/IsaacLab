@@ -24,6 +24,9 @@ from isaaclab.utils import configclass
 from isaaclab_assets import RRLM3_CFG  # isort: skip
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 
+FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy()
+FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.50, 0.50, 0.50)
+
 ##
 # Thruster Layout Configuration
 ##
@@ -87,21 +90,23 @@ class ThrusterCylinderSceneCfg(InteractiveSceneCfg):
     # Cylinder robot as a rigid object
     robot: RigidObjectCfg = RRLM3_CFG.replace(prim_path="/World/envs/env_.*/Robot")
 
-    # robot_frame = FrameTransformerCfg(
-    #     prim_path="{ENV_REGEX_NS}/Cabinet/sektion",
-    #     debug_vis=True,
-    #     visualizer_cfg=FRAME_MARKER_CFG.replace(prim_path="/Visuals/CabinetFrameTransformer"),
-    #     target_frames=[
-    #         FrameTransformerCfg.FrameCfg(
-    #             prim_path="{ENV_REGEX_NS}/Cabinet/drawer_handle_top",
-    #             name="drawer_handle_top",
-    #             offset=OffsetCfg(
-    #                 pos=(0.305, 0.0, 0.01),
-    #                 rot=(0.5, 0.5, -0.5, -0.5),  # align with end-effector frame
-    #             ),
-    #         ),
-    #     ],
-    # )
+    # Frame visualization for robot
+    robot_frame = FrameTransformerCfg(
+        prim_path="{ENV_REGEX_NS}/Robot",  # Source frame (robot root)
+        debug_vis=True,
+        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/RobotFrameTransformer"),
+        target_frames=[
+            # Visualize the robot body frame itself
+            FrameTransformerCfg.FrameCfg(
+                prim_path="{ENV_REGEX_NS}/Robot",
+                name="robot_body",
+                offset=OffsetCfg(
+                    pos=(0.0, 0.0, 0.0),
+                    rot=(1.0, 0.0, 0.0, 0.0),  # identity quaternion (w, x, y, z)
+                ),
+            ),
+        ],
+    )
 
 
 ##
