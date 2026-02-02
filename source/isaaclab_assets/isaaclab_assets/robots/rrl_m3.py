@@ -6,7 +6,6 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import RigidObjectCfg, AssetBaseCfg
 from isaaclab.assets import ArticulationCfg
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 ##
 # Configuration
@@ -23,7 +22,7 @@ RRLM3_CFG = RigidObjectCfg(
                 max_depenetration_velocity=10.0,
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=1.0), # in kg
-            collision_props=sim_utils.CollisionPropertiesCfg(),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.2, 0.6, 0.9),
                 metallic=0.5,

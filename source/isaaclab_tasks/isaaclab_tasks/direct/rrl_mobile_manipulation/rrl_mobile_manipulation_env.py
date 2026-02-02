@@ -1,165 +1,18 @@
 """Thruster Cylinder Environment for Isaac Lab."""
 
 from __future__ import annotations
-from dataclasses import MISSING, field
 
 import torch
 from typing import Dict, Tuple
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import RigidObject, RigidObjectCfg, AssetBaseCfg
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.sim import SimulationCfg, PhysxCfg
-from isaaclab.envs import DirectRLEnvCfg
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.sensors import FrameTransformerCfg, OffsetCfg
-
-from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply
 
 ##
 # Pre-defined configs
 ##
-from isaaclab_assets import RRLM3_CFG  # isort: skip
-from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
-
-FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy()
-FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.50, 0.50, 0.50)
-
-##
-# Thruster Layout Configuration
-##
-
-@configclass
-class ThrusterLayoutCfg:
-    """Configuration for thruster positions and orientations."""
-    
-    # Thruster positions relative to body center (x, y, z)
-    # Front-Right, Front-Left, Back-Right, Back-Left (pointing along X)
-    # Right-Front, Left-Front, Right-Back, Left-Back (pointing along Y)
-    positions: Dict[str, tuple] = field(default_factory=lambda: {
-        "FR": (0.137, -0.120, 0.29757938),
-        "FL": (0.137, 0.120, 0.29757938),
-        "BR": (-0.137, -0.120, 0.29757938),
-        "BL": (-0.137, 0.120, 0.29757938),
-        "RF": (0.120, -0.137, 0.30957938),
-        "LF": (0.120, 0.137, 0.30957938),
-        "RB": (-0.120, -0.137, 0.30957938),
-        "LB": (-0.120, 0.137, 0.30957938),
-    })
-    
-    # Thrust directions for each thruster
-    directions: Dict[str, tuple] = field(default_factory=lambda: {
-        "FR": (1.0, 0.0, 0.0),   # Push forward
-        "FL": (1.0, 0.0, 0.0),   # Push forward
-        "BR": (-1.0, 0.0, 0.0),  # Push backward
-        "BL": (-1.0, 0.0, 0.0),  # Push backward
-        "RF": (0.0, -1.0, 0.0),  # Push right
-        "RB": (0.0, -1.0, 0.0),  # Push right
-        "LF": (0.0, 1.0, 0.0),   # Push left
-        "LB": (0.0, 1.0, 0.0),   # Push left
-    })
-    
-    # Maximum thrust force per thruster (Newtons)
-    max_thrust: float = 10.0
-
-
-##
-# Scene Configuration
-##
-
-@configclass
-class ThrusterCylinderSceneCfg(InteractiveSceneCfg):
-    """Configuration for the thruster cylinder scene."""
-    
-    # Ground plane with zero friction
-    ground = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="plane",
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="min",
-            restitution_combine_mode="max",
-            static_friction=0.0,
-            dynamic_friction=0.0,
-            restitution=0.0,
-        ),
-    ) 
-
-    # Cylinder robot as a rigid object
-    robot: RigidObjectCfg = RRLM3_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-
-    # Frame visualization for robot
-    robot_frame = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot",  # Source frame (robot root)
-        debug_vis=True,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/RobotFrameTransformer"),
-        target_frames=[
-            # Visualize the robot body frame itself
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot",
-                name="robot_body",
-                offset=OffsetCfg(
-                    pos=(0.0, 0.0, 0.0),
-                    rot=(1.0, 0.0, 0.0, 0.0),  # identity quaternion (w, x, y, z)
-                ),
-            ),
-        ],
-    )
-
-
-##
-# Environment Configuration
-##
-
-@configclass
-class ThrusterCylinderEnvCfg(DirectRLEnvCfg):
-    """Configuration for the thruster cylinder RL environment."""
-    
-    # Environment settings
-    decimation = 2  # Control frequency = sim_dt * decimation
-    episode_length_s = 10.0  # 10 seconds per episode
-    
-    # Action space: 8 thrusters (normalized [-1, 1] mapped to [0, max_thrust])
-    action_space = 8
-    
-    # Observation space: position(3) + orientation(4) + linear_vel(3) + angular_vel(3) = 13
-    observation_space = 13
-    
-    # No state space for asymmetric actor-critic
-    state_space = 0
-    
-    # Simulation settings
-    sim: SimulationCfg = SimulationCfg(
-        dt=1.0 / 120.0,  # 120 Hz simulation
-        render_interval=decimation,
-        gravity=(0.0, 0.0, -9.81),  # Normal gravity
-        physx=PhysxCfg(
-            solver_type=1,  # TGS solver
-            enable_stabilization=True,
-        ),
-    )
-    
-    # Scene configuration
-    scene: ThrusterCylinderSceneCfg = ThrusterCylinderSceneCfg(
-        num_envs=4096,
-        env_spacing=4.0,
-    )
-    
-    # Thruster configuration
-    thrusters: ThrusterLayoutCfg = ThrusterLayoutCfg()
-    
-    # Reward scales
-    reward_forward_velocity: float = 1.0  # Reward for moving forward (+X)
-    reward_lateral_penalty: float = -0.1  # Penalty for lateral velocity
-    reward_angular_penalty: float = -0.05  # Penalty for rotation
-    reward_action_penalty: float = -0.001  # Small penalty for using thrusters
-    
-    # Target forward velocity (m/s)
-    target_velocity: float = 2.0
-
-
+from .rrl_mobile_manipulation_env_cfg import ThrusterCylinderEnvCfg  # isort: skip
 
 
 class ThrusterCylinderEnv(DirectRLEnv):
@@ -191,6 +44,7 @@ class ThrusterCylinderEnv(DirectRLEnv):
             "distance_traveled": torch.zeros(self.num_envs, device=self.device),
         }
     
+
     def _setup_thrusters(self):
         """Pre-compute thruster positions and directions as tensors."""
         thruster_names = ["FR", "FL", "BR", "BL", "RF", "LF", "RB", "LB"]
@@ -261,8 +115,8 @@ class ThrusterCylinderEnv(DirectRLEnv):
         robot_quat = self.robot.data.root_quat_w  # (num_envs, 4) in (w, x, y, z) format
         
         # Rotate force and torque vectors to world frame
-        total_force_world = self._quat_rotate(robot_quat, total_force_body)
-        total_torque_world = self._quat_rotate(robot_quat, total_torque_body)
+        total_force_world = quat_apply(robot_quat, total_force_body)
+        total_torque_world = quat_apply(robot_quat, total_torque_body)
         
         # Apply external forces and torques
         # Isaac Lab expects forces at body positions
@@ -291,11 +145,12 @@ class ThrusterCylinderEnv(DirectRLEnv):
         
         self.robot.instantaneous_wrench_composer.set_forces_and_torques(
             forces=forces,
-            torques=torch.zeros_like(torques),
+            torques=torques,
             body_ids=body_ids,
         )
 
         # TODO: consider applying force to specific poistion, not just center of mass, see Isaac Lab docs. 
+    
 
     def _get_observations(self) -> dict:
         """
@@ -380,7 +235,7 @@ class ThrusterCylinderEnv(DirectRLEnv):
         
         # Robot tipped over (check if up vector is pointing down)
         # Get the up vector in world frame by rotating [0, 0, 1] by robot orientation
-        up_world = self._quat_rotate(
+        up_world = quat_apply(
             self.robot.data.root_quat_w,
             torch.tensor([[0.0, 0.0, 1.0]], device=self.device).expand(self.num_envs, -1)
         )
@@ -432,51 +287,3 @@ class ThrusterCylinderEnv(DirectRLEnv):
         for key in self._episode_sums:
             self._episode_sums[key][env_ids] = 0.0
     
-    @staticmethod
-    def _quat_rotate(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
-        """
-        Rotate vectors by quaternions.
-        
-        Args:
-            quat: Quaternions (w, x, y, z) of shape (..., 4)
-            vec: Vectors of shape (..., 3)
-        
-        Returns:
-            Rotated vectors of shape (..., 3)
-        """
-        # Extract quaternion components
-        w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
-        
-        # Extract vector components
-        vx, vy, vz = vec[..., 0], vec[..., 1], vec[..., 2]
-        
-        # Quaternion rotation formula: q * v * q^(-1)
-        # Optimized computation
-        ww = w * w
-        xx = x * x
-        yy = y * y
-        zz = z * z
-        wx = w * x
-        wy = w * y
-        wz = w * z
-        xy = x * y
-        xz = x * z
-        yz = y * z
-        
-        # Rotation matrix elements
-        r00 = ww + xx - yy - zz
-        r01 = 2 * (xy - wz)
-        r02 = 2 * (xz + wy)
-        r10 = 2 * (xy + wz)
-        r11 = ww - xx + yy - zz
-        r12 = 2 * (yz - wx)
-        r20 = 2 * (xz - wy)
-        r21 = 2 * (yz + wx)
-        r22 = ww - xx - yy + zz
-        
-        # Apply rotation
-        out_x = r00 * vx + r01 * vy + r02 * vz
-        out_y = r10 * vx + r11 * vy + r12 * vz
-        out_z = r20 * vx + r21 * vy + r22 * vz
-        
-        return torch.stack([out_x, out_y, out_z], dim=-1)
