@@ -61,13 +61,14 @@ def main():
             actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
             if current_step <= max_action_steps:
                 # actions: [-1, 1]
-                actions[:, :2] = -torch.ones(env.action_space.shape[0], 2, device=env.unwrapped.device) 
+                actions[:, :2] = torch.ones(env.action_space.shape[0], 2, device=env.unwrapped.device) 
             # apply actions
-            obs = env.step(actions)[0]
+            obs, rews, _, _, _ = env.step(actions)
             current_step += 1
 
-            print(f"[INFO]: Lin vel: {obs['policy'][0, 7:10].cpu().numpy()}, "
-                  f"Ang vel: {obs['policy'][0, 10:13].cpu().numpy()}")
+            print(f"[INFO]: Lin vel in body frame: {obs['policy'][0, :3].cpu().numpy()}, "
+                  f"Ang vel in body frame: {obs['policy'][0, 3:6].cpu().numpy()}")
+            print(f"[INFO]: Reward: {rews[0].cpu().numpy()}")
 
     # close the simulator
     env.close()

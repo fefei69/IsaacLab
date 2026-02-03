@@ -24,10 +24,10 @@ from isaaclab.markers import VisualizationMarkers  # isort: skip
 from isaaclab.markers.config import FRAME_MARKER_CFG, RED_ARROW_X_MARKER_CFG  # isort: skip
 from .thruster_layout_cfg import ThrusterLayoutCfg  # isort: skip
 
-FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy()
+FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy() # type: ignore
 FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.50, 0.50, 0.50)
 
-FORCE_ARROW_CFG = RED_ARROW_X_MARKER_CFG.copy()
+FORCE_ARROW_CFG = RED_ARROW_X_MARKER_CFG.copy() # type: ignore
 
 
 ##
@@ -53,7 +53,7 @@ class ThrusterCylinderSceneCfg(InteractiveSceneCfg):
     ) 
 
     # Cylinder robot as a rigid object
-    robot: RigidObjectCfg = RRLM3_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot: RigidObjectCfg = RRLM3_CFG.replace(prim_path="/World/envs/env_.*/Robot") # type: ignore
 
     # Frame visualization for robot
     robot_frame = FrameTransformerCfg(
@@ -95,6 +95,8 @@ class ThrusterCylinderEnvCfg(DirectRLEnvCfg):
     
     # No state space for asymmetric actor-critic
     state_space = 0
+
+    debug_vis = True  
     
     # Simulation settings
     sim: SimulationCfg = SimulationCfg(
@@ -110,17 +112,15 @@ class ThrusterCylinderEnvCfg(DirectRLEnvCfg):
     # Scene configuration
     scene: ThrusterCylinderSceneCfg = ThrusterCylinderSceneCfg(
         num_envs=4096,
-        env_spacing=4.0,
+        env_spacing=2.5,
     )
     
     # Thruster configuration
     thrusters: ThrusterLayoutCfg = ThrusterLayoutCfg()
     
     # Reward scales
-    reward_forward_velocity: float = 1.0  # Reward for moving forward (+X)
-    reward_lateral_penalty: float = -0.1  # Penalty for lateral velocity
-    reward_angular_penalty: float = -0.05  # Penalty for rotation
+    lin_vel_reward_scale: float = -0.05
+    ang_vel_reward_scale: float = -0.01
+    distance_to_goal_reward_scale: float = 15.0
     reward_action_penalty: float = -0.001  # Small penalty for using thrusters
     
-    # Target forward velocity (m/s)
-    target_velocity: float = 2.0

@@ -15,7 +15,7 @@ from isaaclab.assets import ArticulationCfg
 RRLM3_CFG = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.CylinderCfg(
-            radius=0.15, # meters
+            radius=0.2, # meters
             height=0.7, # meters
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,

@@ -7,11 +7,13 @@ from typing import Dict, Tuple
 
 import isaaclab.sim as sim_utils
 from isaaclab.envs import DirectRLEnv
-from isaaclab.utils.math import quat_apply
-
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.utils.math import quat_apply, subtract_frame_transforms
 ##
 # Pre-defined configs
 ##
+from isaaclab.markers import CUBOID_MARKER_CFG, POSITION_GOAL_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
+
 from .rrl_mobile_manipulation_env_cfg import ThrusterCylinderEnvCfg  # isort: skip
 
 
@@ -36,13 +38,23 @@ class ThrusterCylinderEnv(DirectRLEnv):
         
         # Cache thruster positions and directions as tensors
         self._setup_thrusters()
+
+        self._actions = torch.zeros((self.num_envs, 8), device=self.device)
+        # Goal position
+        self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
         
         # Track episode statistics
         self._episode_sums = {
-            "forward_velocity": torch.zeros(self.num_envs, device=self.device),
-            "lateral_velocity": torch.zeros(self.num_envs, device=self.device),
-            "distance_traveled": torch.zeros(self.num_envs, device=self.device),
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            for key in [
+                "lin_vel",
+                "ang_vel",
+                "distance_to_goal",
+            ]
         }
+        # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
+        self.set_debug_vis(self.cfg.debug_vis)
+
     
 
     def _setup_thrusters(self):
@@ -66,14 +78,16 @@ class ThrusterCylinderEnv(DirectRLEnv):
         
         self._max_thrust = self.cfg.thrusters.max_thrust
         self._num_thrusters = len(thruster_names)
+
     
     def _setup_scene(self):
         """Set up the scene with robot and ground."""
         # Add robot to scene
         self.robot = self.scene["robot"]
 
-        # Add ground plane (handled by terrain importer in scene config)
-        # Clone environments
+        self._terrain = self.scene["terrain"]
+
+        # Clone and replicate environments
         self.scene.clone_environments(copy_from_source=False)
 
         # add lights
@@ -129,8 +143,6 @@ class ThrusterCylinderEnv(DirectRLEnv):
         body_ids = self.robot.find_bodies(".*")[0]
         
         # Apply external wrench (force + torque) to robot
-        # Forces shape: (num_envs, num_bodies, 3)
-        # Torques shape: (num_envs, num_bodies, 3)
         forces = self._applied_forces.unsqueeze(1)  # (num_envs, 1, 3)
         torques = self._applied_torques.unsqueeze(1)  # (num_envs, 1, 3)
         
@@ -157,65 +169,39 @@ class ThrusterCylinderEnv(DirectRLEnv):
         Compute observations.
         
         Observations include:
-        - Position (3): x, y, z in world frame
+        - Position (3): x, y, z in body frame
         - Orientation (4): quaternion (w, x, y, z)
-        - Linear velocity (3): vx, vy, vz in world frame
-        - Angular velocity (3): wx, wy, wz in world frame
+        - Linear velocity (3): vx, vy, vz in body frame
+        - Angular velocity (3): wx, wy, wz in body frame
         
         Total: 13 dimensions
         """
+        desired_pos_b, _ = subtract_frame_transforms(
+            self.robot.data.root_pos_w, self.robot.data.root_quat_w, self._desired_pos_w
+        )
+
         obs = torch.cat([
-            self.robot.data.root_pos_w,           # (num_envs, 3)
-            self.robot.data.root_quat_w,          # (num_envs, 4)
-            self.robot.data.root_lin_vel_w,       # (num_envs, 3)
-            self.robot.data.root_ang_vel_w,       # (num_envs, 3)
+            self.robot.data.root_lin_vel_b,       # (num_envs, 3)
+            self.robot.data.root_ang_vel_b,       # (num_envs, 3)
+            desired_pos_b,                         # (num_envs, 3)
         ], dim=-1)
         
         return {"policy": obs}
     
     def _get_rewards(self) -> torch.Tensor:
-        """
-        Compute rewards for moving forward.
-        
-        Reward components:
-        1. Forward velocity reward: positive for moving in +X direction
-        2. Lateral velocity penalty: negative for moving in Y direction
-        3. Angular velocity penalty: negative for rotation
-        4. Action penalty: small negative for using thrust (energy efficiency)
-        """
-        # Get velocities in world frame
-        lin_vel = self.robot.data.root_lin_vel_w  # (num_envs, 3)
-        ang_vel = self.robot.data.root_ang_vel_w  # (num_envs, 3)
-        
-        # Forward velocity (X direction)
-        forward_vel = lin_vel[:, 0]
-        
-        # Lateral velocity (Y direction)
-        lateral_vel = torch.abs(lin_vel[:, 1])
-        
-        # Angular velocity magnitude
-        ang_vel_mag = torch.norm(ang_vel, dim=-1)
-        
-        # Action magnitude (thrust usage)
-        action_mag = torch.sum(torch.abs(self._actions), dim=-1)
-        
-        # Compute reward components
-        # Reward is higher when closer to target velocity
-        forward_reward = self.cfg.reward_forward_velocity * (
-            forward_vel - 0.5 * torch.abs(forward_vel - self.cfg.target_velocity)
-        )
-        lateral_penalty = self.cfg.reward_lateral_penalty * lateral_vel
-        angular_penalty = self.cfg.reward_angular_penalty * ang_vel_mag
-        action_penalty = self.cfg.reward_action_penalty * action_mag
-        
-        # Total reward
-        reward = forward_reward + lateral_penalty + angular_penalty + action_penalty
-        
-        # Update episode statistics
-        self._episode_sums["forward_velocity"] += forward_vel
-        self._episode_sums["lateral_velocity"] += lateral_vel
-        self._episode_sums["distance_traveled"] += forward_vel * self.step_dt
-        
+        lin_vel = torch.sum(torch.square(self.robot.data.root_lin_vel_b), dim=1)
+        ang_vel = torch.sum(torch.square(self.robot.data.root_ang_vel_b), dim=1)
+        distance_to_goal = torch.linalg.norm(self._desired_pos_w - self.robot.data.root_pos_w, dim=1)
+        distance_to_goal_mapped = 1 - torch.tanh(distance_to_goal / 0.8)
+        rewards = {
+            "lin_vel": lin_vel * self.cfg.lin_vel_reward_scale * self.step_dt,
+            "ang_vel": ang_vel * self.cfg.ang_vel_reward_scale * self.step_dt,
+            "distance_to_goal": distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
+        }
+        reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+        # Logging
+        for key, value in rewards.items():
+            self._episode_sums[key] += value
         return reward
     
     def _get_dones(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -249,31 +235,61 @@ class ThrusterCylinderEnv(DirectRLEnv):
     
     def _reset_idx(self, env_ids: torch.Tensor):
         """Reset specified environments."""
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self.robot._ALL_INDICES
+
+        # Logging
+        final_distance_to_goal = torch.linalg.norm(
+            self._desired_pos_w[env_ids] - self.robot.data.root_pos_w[env_ids], dim=1
+        ).mean()
+        extras = dict()
+        for key in self._episode_sums.keys():
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+            self._episode_sums[key][env_ids] = 0.0
+        self.extras["log"] = dict()
+        self.extras["log"].update(extras)
+        extras = dict()
+        extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
+        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
+        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+        self.extras["log"].update(extras)
+
+        self.robot.reset(env_ids)
         super()._reset_idx(env_ids)
         
         # Reset robot state
         num_resets = len(env_ids)
+
+        if len(env_ids) == self.num_envs:
+            # Spread out the resets to avoid spikes in training when many environments reset at a similar time
+            self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
+
+        self._actions[env_ids] = 0.0
         
+        # Sample new commands
+        self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-1.0, 1.0)
+        self._desired_pos_w[env_ids, :2] += self._terrain.env_origins[env_ids, :2]
+
+
         # Random initial positions with small variation
         default_pos = torch.tensor(
             self.cfg.scene.robot.init_state.pos,
             device=self.device
         ).unsqueeze(0).expand(num_resets, -1).clone()
-        
         # Add small random offset to x, y positions
         default_pos[:, :2] += torch.randn(num_resets, 2, device=self.device) * 0.1
-        
+
+        default_pos[:, :2] += self._terrain.env_origins[env_ids, :2]
+
         # Default orientation (identity quaternion)
         default_quat = torch.tensor(
             self.cfg.scene.robot.init_state.rot,
             device=self.device
         ).unsqueeze(0).expand(num_resets, -1).clone()
-        
         # Zero initial velocities
         default_lin_vel = torch.zeros(num_resets, 3, device=self.device)
         default_ang_vel = torch.zeros(num_resets, 3, device=self.device)
-        
-        # Write to simulation
         self.robot.write_root_pose_to_sim(
             torch.cat([default_pos, default_quat], dim=-1),
             env_ids
@@ -283,7 +299,24 @@ class ThrusterCylinderEnv(DirectRLEnv):
             env_ids
         )
         
-        # Reset episode statistics
-        for key in self._episode_sums:
-            self._episode_sums[key][env_ids] = 0.0
+
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        # create markers if necessary for the first time
+        if debug_vis:
+            if not hasattr(self, "goal_pos_visualizer"):
+                marker_cfg = SPHERE_MARKER_CFG.copy()
+                # marker_cfg.markers["cuboid"].size = (0.05, 0.05, 0.05)
+                # -- goal pose
+                marker_cfg.prim_path = "/Visuals/Command/goal_position"
+                self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
+            # set their visibility to true
+            self.goal_pos_visualizer.set_visibility(True)
+        else:
+            if hasattr(self, "goal_pos_visualizer"):
+                self.goal_pos_visualizer.set_visibility(False)
+
+    def _debug_vis_callback(self, event):
+        # update the markers
+        self.goal_pos_visualizer.visualize(self._desired_pos_w)
     
