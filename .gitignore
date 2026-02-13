@@ -75,3 +75,9 @@ tests/
 **/gelsight_r15_data/*
 
 *.sh
+
+/assets/*
+
+# Except this specific file
+!/assets/scenes/
+!/assets/scenes/Lab_rendering.usd
