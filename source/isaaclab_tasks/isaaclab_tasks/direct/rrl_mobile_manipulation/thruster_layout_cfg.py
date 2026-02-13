@@ -33,4 +33,7 @@ class ThrusterLayoutCfg:
     })
     
     # Maximum thrust force per thruster (Newtons)
-    max_thrust: float = 1.0
+    max_thrust: float = 1.7
+
+    thruster_names: list[str] = ["FR", "FL", "BR", "BL", "RF", "LF", "RB", "LB"]
+    

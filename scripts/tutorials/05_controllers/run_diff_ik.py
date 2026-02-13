@@ -53,7 +53,7 @@ from isaaclab.utils.math import subtract_frame_transforms
 ##
 # Pre-defined configs
 ##
-from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG, UR10_CFG  # isort:skip
+from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG, UR10_CFG, CYLINDER_WXAI_CFG  # isort:skip
 
 
 @configclass
@@ -73,18 +73,20 @@ class TableTopSceneCfg(InteractiveSceneCfg):
     )
 
     # mount
-    table = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Table",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/Stand/stand_instanceable.usd", scale=(2.0, 2.0, 2.0)
-        ),
-    )
+    # table = AssetBaseCfg(
+    #     prim_path="{ENV_REGEX_NS}/Table",
+    #     spawn=sim_utils.UsdFileCfg(
+    #         usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/Stand/stand_instanceable.usd", scale=(2.0, 2.0, 2.0)
+    #     ),
+    # )
 
     # articulation
     if args_cli.robot == "franka_panda":
         robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     elif args_cli.robot == "ur10":
         robot = UR10_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    elif args_cli.robot == "rrl_m3":
+        robot = CYLINDER_WXAI_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     else:
         raise ValueError(f"Robot {args_cli.robot} is not supported. Valid: franka_panda, ur10")
 
@@ -107,9 +109,9 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     # Define goals for the arm
     ee_goals = [
-        [0.5, 0.5, 0.7, 0.707, 0, 0.707, 0],
-        [0.5, -0.4, 0.6, 0.707, 0.707, 0.0, 0.0],
-        [0.5, 0, 0.5, 0.0, 1.0, 0.0, 0.0],
+        [0.2, 0.2, -0.1, 0.707, 0, 0.707, 0],
+        [0.3, -0.2, -0.1, 0.707, 0.707, 0.0, 0.0],
+        [0.2, 0, 0.2, -0.05, 1.0, 0.0, 0.0],
     ]
     ee_goals = torch.tensor(ee_goals, device=sim.device)
     # Track the given command
@@ -123,6 +125,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         robot_entity_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"], body_names=["panda_hand"])
     elif args_cli.robot == "ur10":
         robot_entity_cfg = SceneEntityCfg("robot", joint_names=[".*"], body_names=["ee_link"])
+    elif args_cli.robot == "rrl_m3":
+        robot_entity_cfg = SceneEntityCfg("robot", joint_names=["joint_[0-6]"], body_names=["link_6"])
     else:
         raise ValueError(f"Robot {args_cli.robot} is not supported. Valid: franka_panda, ur10")
     # Resolving the scene entities
@@ -130,11 +134,18 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Obtain the frame index of the end-effector
     # For a fixed base robot, the frame index is one less than the body index. This is because
     # the root body is not included in the returned Jacobians.
+    # if robot.is_fixed_base:
+    #     ee_jacobi_idx = robot_entity_cfg.body_ids[0] - 1
+    # else:
+    #     ee_jacobi_idx = robot_entity_cfg.body_ids[0]
+
     if robot.is_fixed_base:
         ee_jacobi_idx = robot_entity_cfg.body_ids[0] - 1
+        jacobi_joint_ids = robot_entity_cfg.joint_ids
     else:
         ee_jacobi_idx = robot_entity_cfg.body_ids[0]
-
+        jacobi_joint_ids = [idx + 6 for idx in robot_entity_cfg.joint_ids]
+    # import pdb; pdb.set_trace()  # --- IGNORE ---
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
     count = 0
@@ -159,7 +170,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             current_goal_idx = (current_goal_idx + 1) % len(ee_goals)
         else:
             # obtain quantities from simulation
-            jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
+            jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, jacobi_joint_ids]
             ee_pose_w = robot.data.body_pose_w[:, robot_entity_cfg.body_ids[0]]
             root_pose_w = robot.data.root_pose_w
             joint_pos = robot.data.joint_pos[:, robot_entity_cfg.joint_ids]
@@ -169,7 +180,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             )
             # compute the joint commands
             joint_pos_des = diff_ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
-
         # apply actions
         robot.set_joint_position_target(joint_pos_des, joint_ids=robot_entity_cfg.joint_ids)
         scene.write_data_to_sim()

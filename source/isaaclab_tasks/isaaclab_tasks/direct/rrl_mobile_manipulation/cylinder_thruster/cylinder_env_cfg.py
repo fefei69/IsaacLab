@@ -5,7 +5,7 @@ import torch
 from typing import Dict, Tuple
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import RigidObject, RigidObjectCfg, AssetBaseCfg
+from isaaclab.assets import RigidObject, RigidObjectCfg, AssetBaseCfg, Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.sim import SimulationCfg, PhysxCfg
@@ -13,22 +13,20 @@ from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.sensors import FrameTransformerCfg, OffsetCfg
+from isaaclab.sensors import TiledCamera, TiledCameraCfg
 
 from isaaclab.utils import configclass
 
 ##
 # Pre-defined configs
 ##
-from isaaclab_assets import RRLM3_CFG  # isort: skip
+from isaaclab_assets import CYLINDER_CFG, RRLM3_CFG  # isort: skip
 from isaaclab.markers import VisualizationMarkers  # isort: skip
+from ..thruster_layout_cfg import ThrusterLayoutCfg  # isort: skip
+
 from isaaclab.markers.config import FRAME_MARKER_CFG, RED_ARROW_X_MARKER_CFG  # isort: skip
-from .thruster_layout_cfg import ThrusterLayoutCfg  # isort: skip
-
 FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy() # type: ignore
-FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.50, 0.50, 0.50)
-
-FORCE_ARROW_CFG = RED_ARROW_X_MARKER_CFG.copy() # type: ignore
-
+FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.250, 0.250, 0.250)
 
 ##
 # Scene Configuration
@@ -52,27 +50,8 @@ class ThrusterCylinderSceneCfg(InteractiveSceneCfg):
         ),
     ) 
 
-    # Cylinder robot as a rigid object
-    robot: RigidObjectCfg = RRLM3_CFG.replace(prim_path="/World/envs/env_.*/Robot") # type: ignore
-
-    # Frame visualization for robot
-    robot_frame = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot",  # Source frame (robot root)
-        debug_vis=False,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/RobotFrameTransformer"),
-        target_frames=[
-            # Visualize the robot body frame itself
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot",
-                name="robot_body",
-                offset=OffsetCfg(
-                    pos=(0.0, 0.0, 0.0),
-                    rot=(1.0, 0.0, 0.0, 0.0),  # identity quaternion (w, x, y, z)
-                ),
-            ),
-        ],
-    )
-
+    # Cylinder robot 
+    robot: RigidObjectCfg = CYLINDER_CFG.replace(prim_path="/World/envs/env_.*/Robot") # type: ignore
 
 
 ##
@@ -87,7 +66,7 @@ class ThrusterCylinderEnvCfg(DirectRLEnvCfg):
     decimation = 2  # Control frequency = sim_dt * decimation
     episode_length_s = 10.0  # 10 seconds per episode
     
-    # Action space: 8 thrusters (normalized [-1, 1] mapped to [0, max_thrust])
+    # Action space: 8 thrusters 
     action_space = 8
     
     # Observation space: position(3) + orientation(4) + linear_vel(3) + angular_vel(3) = 13
@@ -106,6 +85,9 @@ class ThrusterCylinderEnvCfg(DirectRLEnvCfg):
         physx=PhysxCfg(
             solver_type=1,  # TGS solver
             enable_stabilization=True,
+            enable_external_forces_every_iteration=True,  # for thusters to work properly
+            min_velocity_iteration_count=1,  # stable velocity 
+    
         ),
     )
     

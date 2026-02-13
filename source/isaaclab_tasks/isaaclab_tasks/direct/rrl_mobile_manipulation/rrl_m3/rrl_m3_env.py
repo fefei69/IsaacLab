@@ -8,42 +8,56 @@ from typing import Dict, Tuple
 import isaaclab.sim as sim_utils
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
-from isaaclab.utils.math import quat_apply, subtract_frame_transforms
+from isaaclab.assets import Articulation
+from isaaclab.utils.math import quat_apply, subtract_frame_transforms, quat_from_euler_xyz
 ##
 # Pre-defined configs
 ##
-from isaaclab.markers import CUBOID_MARKER_CFG, POSITION_GOAL_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
+from isaaclab.markers import CUBOID_MARKER_CFG, POSITION_GOAL_MARKER_CFG, SPHERE_MARKER_CFG, FRAME_MARKER_CFG  # isort: skip
+FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy() # type: ignore
+FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.250, 0.250, 0.250)
 
-from .rrl_mobile_manipulation_env_cfg import ThrusterCylinderEnvCfg  # isort: skip
+from .rrl_m3_env_cfg import M3EnvCfg  # isort: skip
 
 
-class ThrusterCylinderEnv(DirectRLEnv):
-    """
-    A simple environment with a cylinder robot controlled by 8 thrusters.
+class M3Env(DirectRLEnv):
+    # pre-physics step calls
+    #   |-- _pre_physics_step(action)
+    #   |-- _apply_action()
+    # post-physics step calls
+    #   |-- _get_dones()
+    #   |-- _get_rewards()
+    #   |-- _reset_idx(env_ids)
+    #   |-- _get_observations()
     
-    The robot has 8 thrusters arranged around the cylinder body:
-    - 4 thrusters for forward/backward motion (FR, FL, BR, BL)
-    - 4 thrusters for lateral motion (RF, LF, RB, LB)
+    cfg: M3EnvCfg
     
-    Action space: 8 continuous values in [-1, 1], mapped to thrust forces
-    Observation space: [pos(3), quat(4), lin_vel(3), ang_vel(3)] = 13 dims
-    
-    Goal: Move forward (+X direction) as fast as possible.
-    """
-    
-    cfg: ThrusterCylinderEnvCfg
-    
-    def __init__(self, cfg: ThrusterCylinderEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: M3EnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         
-        # Cache thruster positions and directions as tensors
+        # Initialization
         self._setup_thrusters()
-
-        self._actions = torch.zeros((self.num_envs, 8), device=self.device)
-        # Goal position
-        self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
         
-        # Track episode statistics
+
+        # DEBUG: Print joint information
+        print(f"Total joints: {self.robot.num_joints}")  
+        print(f"Joint names: {self.robot.joint_names}")  
+        # Check actuated joints
+        actuated_joints = []
+        for actuator in self.robot.actuators.values():
+            actuated_joints.extend(actuator.joint_names)
+        print(f"Actuated joints: {len(actuated_joints)}")  
+        print(f"Actuated joint names: {actuated_joints}")  
+
+        # Arm joint position targets
+        self.robot_dof_targets = torch.zeros((self.num_envs, self.robot.num_joints), device=self.device)
+        # Base goal position targets in world frame
+        self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        # Goal orientation 
+        self._desired_ori_w = torch.zeros(self.num_envs, 4, device=self.device) 
+        
+        # Track RL episode statistics
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
@@ -52,14 +66,14 @@ class ThrusterCylinderEnv(DirectRLEnv):
                 "distance_to_goal",
             ]
         }
+
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
 
     
 
     def _setup_thrusters(self):
-        """Pre-compute thruster positions and directions as tensors."""
-        thruster_names = ["FR", "FL", "BR", "BL", "RF", "LF", "RB", "LB"]
+        thruster_names = self.cfg.thrusters.thruster_names
         
         # Positions: (8, 3)
         positions = []
@@ -83,10 +97,13 @@ class ThrusterCylinderEnv(DirectRLEnv):
     def _setup_scene(self):
         """Set up the scene with robot and ground."""
         # Add robot to scene
-        self.robot = self.scene["robot"]
-
+        self.robot = Articulation(self.cfg.robot)
+        self.scene.articulations["robot"] = self.robot
         self._terrain = self.scene["terrain"]
 
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
         # Clone and replicate environments
         self.scene.clone_environments(copy_from_source=False)
 
@@ -94,25 +111,15 @@ class ThrusterCylinderEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
     
-    def _pre_physics_step(self, actions: torch.Tensor):
-        """
-        Process actions before physics simulation step.
-        
-        Actions are normalized [-1, 1] and mapped to thrust forces [0, max_thrust].
-        We use (action + 1) / 2 to map [-1, 1] -> [0, 1], then scale by max_thrust.
-        """
+    def _pre_physics_step(self, actions: torch.Tensor): 
+        """Process actions to compute thruster forces and torques."""
         self._actions = actions.clone()
         
         # Map actions from [-1, 1] to [0, max_thrust]
-        # This ensures thrusters can only push, not pull
-        thrust_magnitudes = (actions + 1.0) * 0.5 * self._max_thrust  # (num_envs, 8)
+        thrust_magnitudes = (self._actions[:, :8] + 1.0) * 0.5 * self._max_thrust  # (num_envs, 8)
         
         # Compute forces in body frame
-        # forces = magnitude * direction for each thruster
-        # thrust_magnitudes: (num_envs, 8) -> (num_envs, 8, 1)
-        # directions: (8, 3) -> (1, 8, 3)
-        forces_body = thrust_magnitudes.unsqueeze(-1) * self._thruster_directions.unsqueeze(0)
-        # forces_body: (num_envs, 8, 3)
+        forces_body = thrust_magnitudes.unsqueeze(-1) * self._thruster_directions.unsqueeze(0) # (num_envs, 8, 3)
         
         # Sum all thruster forces to get total force
         total_force_body = forces_body.sum(dim=1)  # (num_envs, 3)
@@ -124,66 +131,49 @@ class ThrusterCylinderEnv(DirectRLEnv):
             dim=-1
         )
         total_torque_body = torques_body.sum(dim=1)  # (num_envs, 3)
-        
-        # Transform forces and torques to world frame using robot orientation
-        robot_quat = self.robot.data.root_quat_w  # (num_envs, 4) in (w, x, y, z) format
-        
-        # Rotate force and torque vectors to world frame
-        total_force_world = quat_apply(robot_quat, total_force_body)
-        total_torque_world = quat_apply(robot_quat, total_torque_body)
+                
         
         # Apply external forces and torques
-        # Isaac Lab expects forces at body positions
-        self._applied_forces = total_force_world
-        self._applied_torques = total_torque_world
+        self._applied_forces = total_force_body
+        self._applied_torques = total_torque_body
+        self.robot_dof_targets[:, :-1] = self._actions[:, 8:]  
+        
     
     def _apply_action(self):
         """Apply the computed forces and torques to the robot."""
         # Get robot body indices
-        body_ids = self.robot.find_bodies(".*")[0]
+        body_ids = self.robot.find_bodies("alpha3_v4_part_glb")[0] # Cylinder, alpha3_v4_part_glb
         
         # Apply external wrench (force + torque) to robot
         forces = self._applied_forces.unsqueeze(1)  # (num_envs, 1, 3)
         torques = self._applied_torques.unsqueeze(1)  # (num_envs, 1, 3)
         
-        #################
-        # deprecated API, check https://isaac-sim.github.io/IsaacLab/main/source/refs/release_notes.html#external-force-and-torque-application-wrench-composers
-        #################
-        # self.robot.set_external_force_and_torque(
-        #     forces=forces,
-        #     torques=torch.zeros_like(torques),
-        #     body_ids=body_ids
-        #     )
         
+        # TODO: consider applying force to specific poistion, not just center of mass, see Isaac Lab docs.
         self.robot.instantaneous_wrench_composer.set_forces_and_torques(
             forces=forces,
             torques=torques,
             body_ids=body_ids,
         )
 
-        # TODO: consider applying force to specific poistion, not just center of mass, see Isaac Lab docs. 
+        # apply arm joint position targets
+        self.robot.set_joint_position_target(self.robot_dof_targets) 
     
 
     def _get_observations(self) -> dict:
-        """
-        Compute observations.
-        
-        Observations include:
-        - Position (3): x, y, z in body frame
-        - Orientation (4): quaternion (w, x, y, z)
-        - Linear velocity (3): vx, vy, vz in body frame
-        - Angular velocity (3): wx, wy, wz in body frame
-        
-        Total: 13 dimensions
-        """
+      
         desired_pos_b, _ = subtract_frame_transforms(
             self.robot.data.root_pos_w, self.robot.data.root_quat_w, self._desired_pos_w
+        )
+        _, desired_ori_b = subtract_frame_transforms( 
+            torch.zeros_like(self.robot.data.root_pos_w), self.robot.data.root_quat_w, torch.zeros_like(self._desired_pos_w), self._desired_ori_w
         )
 
         obs = torch.cat([
             self.robot.data.root_lin_vel_b,       # (num_envs, 3)
             self.robot.data.root_ang_vel_b,       # (num_envs, 3)
             desired_pos_b,                         # (num_envs, 3)
+            desired_ori_b,                        # (num_envs, 4)
         ], dim=-1)
         
         return {"policy": obs}
@@ -210,14 +200,14 @@ class ThrusterCylinderEnv(DirectRLEnv):
         
         Episodes terminate when:
         1. Time limit reached
-        2. Robot falls below ground (z < 0)
+        2. Robot falls below ground (z < -0.1) to prevent weird artifacts
         3. Robot tips over (large roll/pitch angle)
         """
         # Time limit
-        time_out = self.episode_length_buf >= self.max_episode_length
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
         
         # Robot fell
-        fell = self.robot.data.root_pos_w[:, 2] < 0.0
+        fell = self.robot.data.root_pos_w[:, 2] < -0.1
         
         # Robot tipped over (check if up vector is pointing down)
         # Get the up vector in world frame by rotating [0, 0, 1] by robot orientation
@@ -271,52 +261,55 @@ class ThrusterCylinderEnv(DirectRLEnv):
         self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-1.0, 1.0)
         self._desired_pos_w[env_ids, :2] += self._terrain.env_origins[env_ids, :2]
 
+        # For orientation, we can sample a random yaw angle and convert to quaternion
+        random_yaw = torch.zeros(num_resets, device=self.device).uniform_(0, torch.pi/3) # (N, )
+        self._desired_ori_w[env_ids] = quat_from_euler_xyz(torch.zeros_like(random_yaw), torch.zeros_like(random_yaw), random_yaw) # (N, 4)
 
-        # Random initial positions with small variation
-        default_pos = torch.tensor(
-            self.cfg.scene.robot.init_state.pos,
-            device=self.device
-        ).unsqueeze(0).expand(num_resets, -1).clone()
-        # Add small random offset to x, y positions
-        default_pos[:, :2] += torch.randn(num_resets, 2, device=self.device) * 0.1
 
-        default_pos[:, :2] += self._terrain.env_origins[env_ids, :2]
-
-        # Default orientation (identity quaternion)
-        default_quat = torch.tensor(
-            self.cfg.scene.robot.init_state.rot,
-            device=self.device
-        ).unsqueeze(0).expand(num_resets, -1).clone()
-        # Zero initial velocities
-        default_lin_vel = torch.zeros(num_resets, 3, device=self.device)
-        default_ang_vel = torch.zeros(num_resets, 3, device=self.device)
-        self.robot.write_root_pose_to_sim(
-            torch.cat([default_pos, default_quat], dim=-1),
-            env_ids
-        )
-        self.robot.write_root_velocity_to_sim(
-            torch.cat([default_lin_vel, default_ang_vel], dim=-1),
-            env_ids
-        )
+        # Reset robot state
+        joint_pos = self.robot.data.default_joint_pos[env_ids]
+        joint_vel = self.robot.data.default_joint_vel[env_ids]
+        default_root_state = self.robot.data.default_root_state[env_ids]
+        default_root_state[:, :3] += self._terrain.env_origins[env_ids]
+        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         
 
-
     def _set_debug_vis_impl(self, debug_vis: bool):
-        # create markers if necessary for the first time
         if debug_vis:
+            # Goal marker (sphere)
             if not hasattr(self, "goal_pos_visualizer"):
                 marker_cfg = SPHERE_MARKER_CFG.copy()
-                # marker_cfg.markers["cuboid"].size = (0.05, 0.05, 0.05)
-                # -- goal pose
+                ori_marker_cfg = FRAME_MARKER_SMALL_CFG.copy()
                 marker_cfg.prim_path = "/Visuals/Command/goal_position"
+                ori_marker_cfg.prim_path = "/Visuals/Command/goal_orientation"
                 self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
-            # set their visibility to true
+                self.goal_ori_visualizer = VisualizationMarkers(ori_marker_cfg)
+            
+            # Robot frame marker (axes)
+            if not hasattr(self, "robot_frame_visualizer"):
+                marker_cfg = FRAME_MARKER_SMALL_CFG.copy()
+                marker_cfg.prim_path = "/Visuals/RobotFrame"
+                self.robot_frame_visualizer = VisualizationMarkers(marker_cfg)
+            
             self.goal_pos_visualizer.set_visibility(True)
+            self.goal_ori_visualizer.set_visibility(True)
+            self.robot_frame_visualizer.set_visibility(True)
         else:
             if hasattr(self, "goal_pos_visualizer"):
                 self.goal_pos_visualizer.set_visibility(False)
+                self.goal_ori_visualizer.set_visibility(False)
+            if hasattr(self, "robot_frame_visualizer"):
+                self.robot_frame_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
-        # update the markers
+        # Goal sphere
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
-    
+        # Goal frame (orientation)
+        self.goal_ori_visualizer.visualize(self._desired_pos_w, self._desired_ori_w)
+        
+        # Robot frame at robot position (offset to top of cylinder)
+        robot_pos = self.robot.data.root_pos_w.clone()
+        robot_pos[:, 2] += 0.35  # Offset to top of cylinder
+        self.robot_frame_visualizer.visualize(robot_pos, self.robot.data.root_quat_w)
