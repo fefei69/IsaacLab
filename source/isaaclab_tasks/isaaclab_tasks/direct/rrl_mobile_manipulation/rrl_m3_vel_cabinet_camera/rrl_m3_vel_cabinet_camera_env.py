@@ -271,7 +271,7 @@ class M3VelCabinetCameraEnv(DirectRLEnv):
 
         # TODO: should not pass reward scales
         return self._compute_rewards(
-            self.actions,
+            self._actions,
             self.cabinet.data.joint_pos,
             self.robot_grasp_pos,
             self.drawer_grasp_pos,
